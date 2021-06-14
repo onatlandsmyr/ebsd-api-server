@@ -3,8 +3,12 @@ import os
 from typing import List, Optional, Tuple, Dict, Literal, Union
 from enum import Enum
 from fastapi import Depends, APIRouter
+from fastapi.exceptions import HTTPException
 from pydantic import BaseModel
+from ..utils.image import get_image_from_array
+from fastapi.responses import StreamingResponse
 
+import numpy as np
 import kikuchipy as kp
 
 router = APIRouter(
@@ -13,10 +17,6 @@ router = APIRouter(
     # dependencies=[Depends(get_token_header)],
     # responses={404: {"description": "Not found"}},
 )
-
-kp_signals: Dict[str, kp.signals.EBSD] = {}
-
-# ebsd_info: Dict[str, EBSDInfo] = {}
 
 
 class MetadataEBSD(BaseModel):
@@ -46,6 +46,7 @@ class EBSDInfo(BaseModel):
     nav_height: int
     nav_x_index: int = 0
     nav_y_index: int = 0
+    nav_map: Optional[str] = None
     lazy: bool = False
 
     # TODO: validate indexes against width and height
@@ -54,11 +55,25 @@ class EBSDInfo(BaseModel):
 class LoadPatterns(BaseModel):
     uid: str
     file_path: str
-    lazy: bool = False
+    lazy: bool = True
+
+
+class SavePatterns(BaseModel):
+    uid: str
+    file_path: str
+    overwrite: Optional[bool] = None
+
+
+kp_signals: Dict[str, kp.signals.EBSD] = {}
+ebsd_info: Dict[str, EBSDInfo] = {}
+logs = {}
+maps = {}
 
 
 @router.post("/load", response_model=EBSDInfo)
 async def load_patterns(l: LoadPatterns):
+    kp_signals.clear()
+    ebsd_info.clear()
 
     # Try to load patterns into the kikuchipy.signals.EBSD class
     s = kp.load(l.file_path, lazy=l.lazy)
@@ -99,9 +114,8 @@ async def load_patterns(l: LoadPatterns):
     ebsd = EBSDInfo.parse_obj(
         {
             "uid": l.uid,
-            "path": l.file_path,
+            "file_path": l.file_path,
             "file_extension": file_extension[1:],
-            "name": name,
             "metadata": metadata,
             "sig_width": sig_width,
             "sig_height": sig_height,
@@ -111,7 +125,61 @@ async def load_patterns(l: LoadPatterns):
         }
     )
     kp_signals[l.uid] = s
+    nav_map = mean_intensity(ebsd)
+    maps[l.uid] = {"mean_intensity": nav_map, "img_type": "base64"}
+    ebsd.nav_map = nav_map
 
+    ebsd_info[l.uid] = ebsd
     ##ebsd.nav_map = mean_intensity(uuid)
     return ebsd
 
+
+def mean_intensity(ebsd: EBSDInfo, percentiles=(0.1, 99.9)):
+    s = kp_signals[ebsd.uid]
+    sig_axes = s.axes_manager.signal_indices_in_array
+    data = np.mean(s.data, axis=sig_axes)
+    if ebsd.lazy:
+        data = data.compute()
+    base64str = get_image_from_array(data, percentiles=percentiles)
+    return base64str
+
+
+@router.post("/save")
+async def save_patterns(save: SavePatterns):
+    kp_signals[save.uid].save(save.file_path, overwrite=save.overwrite)
+
+
+@router.get("/{uid}")
+async def read_pattern(uid: str, x: int, y: int):
+    im_data = kp_signals[uid].data[y, x]
+    if ebsd_info[uid].lazy:
+        im_data = im_data.compute()
+    # Update db_EBSD TODO
+
+    image = get_image_from_array(im_data, encoding="binary", percentiles=None, mode="L")
+    headers = {
+        "Cache-Control": "private",
+    }
+    return StreamingResponse(image, media_type="image/png", headers=headers)
+
+
+@router.get("/logs")
+def get_log(log_id: str):
+    if log_id not in logs:
+        raise HTTPException(status_code=404, detail="Log not found")
+    f = logs[log_id]
+    print("log_id")
+    log_text = "\n".join([line.split("\r")[-1] for line in f.getvalue().split("\n")])
+    return log_text
+
+
+@router.get("/info/{uid}")
+def get_ebsd_info(uid: str):
+    if uid not in ebsd_info:
+        raise HTTPException(status_code=404, detail="Dataset not loaded")
+    return ebsd_info[uid]
+
+
+@router.get("/")
+def loaded_datasets():
+    return list(ebsd_info.values())

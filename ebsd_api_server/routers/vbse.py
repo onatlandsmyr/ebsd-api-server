@@ -33,9 +33,6 @@ class vBSEColorImagingIn(BaseModel):
     percentile_contrast_stretch: Optional[Tuple[float, float]] = None
 
 
-vbse_color_arrays = {}
-
-
 class vBSEColorImagingOut(BaseModel):
     red: Optional[str]
     green: Optional[str]
@@ -43,14 +40,21 @@ class vBSEColorImagingOut(BaseModel):
     rgb: Optional[str]
 
 
+vbse_color_arrays = {}
+computed_sums = {}
+
+
 @router.post("/rgb", response_model=vBSEColorImagingOut)
 def vbse_color_imaging(vbse: vBSEColorImagingIn):
     ebsd = vbse.ebsd
     s = kp_signals[ebsd.uid]
     if ebsd.uid not in vbse_color_arrays:
+        vbse_color_arrays.clear()
+        computed_sums.clear()
         vbse_color_arrays[ebsd.uid] = np.zeros(
             (ebsd.nav_height, ebsd.nav_width, 3), "uint8"
         )
+
     colors = ["red", "green", "blue"]
     response = {}
     for i, rects in enumerate([vbse.red, vbse.green, vbse.blue]):
@@ -61,7 +65,16 @@ def vbse_color_imaging(vbse: vBSEColorImagingIn):
                 r = l + rect.x_size
                 t = rect.y_start
                 b = t + rect.y_size
-                vbse_data += np.sum(s.data[..., t:b, l:r], axis=(-2, -1))
+                roi_key = f"{l}_{r}_{t}_{b}"
+                if roi_key in computed_sums:
+                    sig_rect_sum = computed_sums[roi_key]
+                else:
+                    sig_rect_sum = np.sum(s.data[..., t:b, l:r], axis=(-2, -1))
+                    computed_sums[roi_key] = sig_rect_sum
+                if ebsd.lazy:
+                    sig_rect_sum = sig_rect_sum.compute()
+                    computed_sums[roi_key] = sig_rect_sum
+                vbse_data += sig_rect_sum
             vbse_data = rescale_intensities(
                 vbse_data, percentiles=vbse.percentile_contrast_stretch
             )
@@ -71,4 +84,3 @@ def vbse_color_imaging(vbse: vBSEColorImagingIn):
         vbse_color_arrays[ebsd.uid], mode="RGB", percentiles=None
     )
     return vBSEColorImagingOut.parse_obj(response)
-

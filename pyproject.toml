@@ -14,6 +14,10 @@ kikuchipy = "0.3.2"
 llvmlite = "^0.31"
 scikit-image = "0.16.2"
 uvicorn = {extras = ["standard"], version = "^0.13.4"}
+janus = "^0.6.1"
+# orix = "^0.5.1"
+#orix = { git = "https://github.com/pyxem/orix.git", rev = "13ff938d673af777bbd8f45bee50f3cad037e5b7"}
+orix = {path = "/home/ole/git/orix", develop = true}
 
 [tool.poetry.dev-dependencies]
 pytest = "^4.6"

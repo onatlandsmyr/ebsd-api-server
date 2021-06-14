@@ -10,10 +10,11 @@ def get_image_from_array(
     data,
     encoding: Literal["base64", "binary"] = "base64",
     percentiles=None,
+    rescale=False,
     mode=None,
     format="PNG",
 ):
-    if percentiles is not None:
+    if percentiles is not None or rescale:
         data = rescale_intensities(data, percentiles)
     im = Image.fromarray(data, mode=mode)
     image = io.BytesIO()

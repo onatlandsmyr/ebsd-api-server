@@ -1,14 +1,16 @@
+import io
+from contextlib import redirect_stdout
 from typing import List, Optional, Dict, Literal, Union, Tuple
 from enum import Enum
 from uuid import UUID
 from fastapi import Depends, APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse
 from pydantic import BaseModel
 import numpy as np
 import kikuchipy as kp
 
 from scipy.ndimage import correlate
-from .ebsd import kp_signals, EBSDInfo
+from .ebsd import kp_signals, EBSDInfo, logs
 from ..utils.image import get_image_from_array
 
 router = APIRouter(
@@ -36,7 +38,7 @@ class RemoveDynamicBackground(BaseModel):
 
 class AverageNeighbors(BaseModel):
     window: Literal["gaussian", "circular"] = "gaussian"
-    window_shape: Tuple[int, int] = (3, 3)
+    shape: Tuple[int, int] = (3, 3)
     std: Optional[float] = None
 
 
@@ -46,8 +48,8 @@ class Rescale(BaseModel):
 
 class ProcessIntensities(BaseModel):
     ebsd_info: Optional[EBSDInfo]
-    static: Optional[RemoveStaticBackground] = None
-    dynamic: Optional[RemoveDynamicBackground] = None
+    static_bg: Optional[RemoveStaticBackground] = None
+    dynamic_bg: Optional[RemoveDynamicBackground] = None
     average: Optional[AverageNeighbors] = None
     rescale: Optional[Rescale] = None
 
@@ -67,9 +69,9 @@ async def preview_process_intensities(req: ProcessIntensities):
     if is_averaging:
         # window bounds
         wt = 0
-        wb = req.average.window_shape[0]
+        wb = req.average.shape[0]
         wl = 0
-        wr = req.average.window_shape[1]
+        wr = req.average.shape[1]
 
         # window extent
         dy = wb // 2
@@ -109,17 +111,18 @@ async def preview_process_intensities(req: ProcessIntensities):
         s = s.inav[x, y].deepcopy()
 
     # TODO: more manually with sent static_bg or stored here in py, dont rely on metadata and EBSD method.
-    if req.static is not None:
-        s.remove_static_background(**req.static.dict())
+    if req.static_bg is not None:
+        s.remove_static_background(**req.static_bg.dict())
     # TODO: with chunk.remove_dynamic_background
-    if req.dynamic is not None:
+    if req.dynamic_bg is not None:
         s.remove_dynamic_background(
-            operation=req.dynamic.operation, filter_domain=req.dynamic.filter_domain
+            operation=req.dynamic_bg.operation,
+            filter_domain=req.dynamic_bg.filter_domain,
         )
+    if req.ebsd_info.lazy:
+        s.compute()
     if is_averaging:
-        window = kp.filters.Window(
-            window=req.average.window, shape=req.average.window_shape
-        )
+        window = kp.filters.Window(**req.average.dict(exclude_none=True))
         window = window[wt:wb, wl:wr, None, None]
         window_sum = np.sum(window)
         img_data = (np.sum(window * s.data, axis=(0, 1)) / window_sum).astype(np.uint8)
@@ -133,20 +136,38 @@ async def preview_process_intensities(req: ProcessIntensities):
     return StreamingResponse(image, media_type="image/png", headers=headers)
 
 
-@router.post("/execute")
-async def process_intensities(req: ProcessIntensities):
+@router.post("/execute", response_class=PlainTextResponse)
+def process_intensities(req: ProcessIntensities):
     if req.ebsd_info.uid not in kp_signals:
         raise HTTPException(status_code=404, detail="Patterns not found")
 
     s = kp_signals[req.ebsd_info.uid]
-    if req.static is not None:
-        s.remove_static_background(**req.static.dict())
-    if req.dynamic is not None:
-        s.remove_dynamic_background(
-            operation=req.dynamic.operation, filter_domain=req.dynamic.filter_domain
-        )
+
+    f = io.StringIO()
+    logs["process_intensities"] = f
+    if req.static_bg is not None:
+        with redirect_stdout(f):
+            s.remove_static_background(**req.static_bg.dict())
+    if req.dynamic_bg is not None:
+        with redirect_stdout(f):
+            s.remove_dynamic_background(
+                operation=req.dynamic_bg.operation,
+                filter_domain=req.dynamic_bg.filter_domain,
+            )
     if req.average is not None:
-        pass
-        # s.average
+        with redirect_stdout(f):
+            window = kp.filters.Window(**req.average.dict(exclude_none=True))
+            s.average_neighbour_patterns(window=window)
 
     # TODO: average, rescale, lazy and capture logs/progression
+    return "\n".join([line.split("\r")[-1] for line in f.getvalue().split("\n")])
+
+
+@router.get("/log", response_class=PlainTextResponse)
+def log():
+    log_id = "process_intensities"
+    if log_id not in logs:
+        raise HTTPException(status_code=404, detail="Log not found")
+    f = logs[log_id]
+    log_text = "\n".join([line.split("\r")[-1] for line in f.getvalue().split("\n")])
+    return log_text
